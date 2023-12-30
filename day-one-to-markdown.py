@@ -18,8 +18,8 @@ class Zip(object):
 
     def __enter__(self):
         self.directory = tempfile.TemporaryDirectory()
-        zip = zipfile.ZipFile(self.path, "r")
-        zip.extractall(self.directory.name)
+        _zip = zipfile.ZipFile(self.path, "r")
+        _zip.extractall(self.directory.name)
         return self
 
     def __exit__(self, *args, **kwargs):
@@ -48,10 +48,39 @@ class Photo(object):
             return ".jpeg"
 
 
+class PdfAttachment(object):
+    def __init__(self, directory, data):
+        self.directory = directory
+        self.data = data
+
+    @property
+    def basename(self):
+        return "%s%s" % (self.data["md5"], self.ext)
+
+    @property
+    def path(self):
+        return os.path.join(self.directory, self.basename)
+
+    @property
+    def ext(self):
+        try:
+            return ".%s" % (self.data["type"],)
+        except KeyError:
+            return ".pdf"
+
+
 class Markdown(object):
     def __init__(self, content=None, metadata=None):
         self.content = content
         self.metadata = metadata
+
+
+def copy_failure(uuid, src, dst):
+    print(
+        f"""[ERROR]attachment copy failed: ({uuid})
+  src: {src}
+  dst: {dst}"""
+    )
 
 
 def main():
@@ -77,8 +106,8 @@ def main():
         journal_js = "Journal.json"
         destination = os.path.abspath(options.destination)
 
-    with Zip(options.path) as zip:
-        with open(os.path.join(zip.directory.name, journal_js), "r") as fh:
+    with Zip(options.path) as _zip:
+        with open(os.path.join(_zip.directory.name, journal_js), "rb") as fh:
             data = json.load(fh)
             directory = os.path.join(os.path.dirname(options.path))
 
@@ -90,11 +119,17 @@ def main():
 
             os.makedirs(post_directory)
 
+            try:
+                content = post["text"]
+            except KeyError:
+                print(f'[ERROR] post without text ({post["uuid"]})')
+                content = ""
+
             photos = []
             if "photos" in post:
                 photos = {
                     data["identifier"]: Photo(
-                        os.path.join(zip.directory.name, "photos"), data
+                        os.path.join(_zip.directory.name, "photos"), data
                     )
                     for data in post["photos"]
                 }
@@ -110,39 +145,75 @@ def main():
                             photo.path, os.path.join(post_directory, photo.basename)
                         )
                     except FileNotFoundError:
-                        print(
-                            f"""[ERROR]photo copy failed: ({post["uuid"]})
-  src: {photo.path}
-  dst: {os.path.join(post_directory, photo.basename)}"""
+                        copy_failure(
+                            post["uuid"],
+                            photo.path,
+                            os.path.join(post_directory, photo.basename),
                         )
 
-            try:
-                content = post["text"]
-            except KeyError:
-                print(f'[ERROR] post without text ({post["uuid"]})')
-                content = ""
+                def photo_replacement(match):
+                    return photos[match.group(1)].basename
 
-            def replacement(match):
-                return photos[match.group(1)].basename
+                content = re.sub(
+                    "dayone-moment://([0-9a-zA-Z]+)", photo_replacement, content
+                )
 
-            content = re.sub("dayone-moment://([0-9a-zA-Z]+)", replacement, content)
+            pdfs = []
+            if "pdfAttachments" in post:
+                pdfs = {
+                    data["identifier"]: PdfAttachment(
+                        os.path.join(_zip.directory.name, "pdfs"), data
+                    )
+                    for data in post["pdfAttachments"]
+                }
+
+                for _, pdf in pdfs.items():
+                    if "md5" not in pdf.data:
+                        print(f'[ERROR] pdf without md5, etc. ({post["uuid"]})')
+                        pdf.data["md5"] = "stubbed_basename"
+                        continue
+
+                    try:
+                        shutil.copy(
+                            pdf.path, os.path.join(post_directory, pdf.basename)
+                        )
+                    except FileNotFoundError:
+                        copy_failure(
+                            post["uuid"],
+                            pdf.path,
+                            os.path.join(post_directory, pdf.basename),
+                        )
+
+                def pdf_replacement(match):
+                    try:
+                        return pdfs[match.group(1)].basename
+                    except KeyError:
+                        print(f"[ERROR] missing pdf (pdf identifier: {match.group(1)})")
+                        return "missing_pdf"
+
+                content = re.sub(
+                    "dayone-moment:/pdfAttachment/([0-9a-zA-Z]+)",
+                    pdf_replacement,
+                    content,
+                )
 
             metadata = dict(post)
-
+            metadata["date"] = metadata["creationDate"]
             # remove extraneous fields from metadata
-            for d in ["text", "richText", "photos"]:
+            for d in ["text", "richText", "photos", "creationDate", "pdfAttachments"]:
                 if d in metadata:
                     del metadata[d]
 
-            metadata["date"] = metadata["creationDate"]
-            del metadata["creationDate"]
             try:
                 metadata["location"]["title"] = metadata["location"]["placeName"]
             except KeyError:
                 pass
+
             markdown = Markdown(content=content, metadata=metadata)
 
-            with open(os.path.join(post_directory, "index.md"), "w") as fh:
+            with open(
+                os.path.join(post_directory, "index.md"), "w", encoding="utf-8"
+            ) as fh:
                 fh.write(frontmatter.dumps(markdown))
                 fh.write("\n")
 
